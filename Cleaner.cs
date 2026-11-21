@@ -49,6 +49,10 @@ internal static class Cleaner
         return (s.AvailPhys, s.TotalPhys, pct);
     }
 
+    // процессы, чьи рабочие наборы не трогаем — запись/кодирование не должно фризить
+    static readonly HashSet<string> SkipNames = new(StringComparer.OrdinalIgnoreCase)
+        { "ClipBar", "ffmpeg", "ffprobe", "javaw", "java", "MemCleaner" };
+
     static int EmptyAllWorkingSets()
     {
         int done = 0;
@@ -56,6 +60,7 @@ internal static class Cleaner
         {
             try
             {
+                if (SkipNames.Contains(p.ProcessName)) continue;
                 var h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, false, p.Id);
                 if (h == IntPtr.Zero) continue;
                 try { if (EmptyWorkingSet(h)) done++; }
