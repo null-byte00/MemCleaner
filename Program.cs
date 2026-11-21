@@ -46,6 +46,13 @@ internal static class Program
         if (o.Tray)
             return TrayApp.Run(o);   // без консоли
 
+        // без флагов — интерактивное меню; --watch — консольный цикл
+        if (!o.Watch && args.Length == 0)
+            return RunMenu(o);
+
+        if (o.Tray)
+            return TrayApp.Run(o);   // без консоли
+
         // консольный режим: подцепиться к родительской консоли или создать свою
         var attached = Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS);
         var allocated = !attached && Win32.AllocConsole();
@@ -76,6 +83,92 @@ internal static class Program
             }
         }
         return 0;
+    }
+
+    // ---------- интерактивное меню ----------
+    static int RunMenu(Options o)
+    {
+        if (!Console.IsOutputRedirected && !Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS))
+            Win32.AllocConsole();
+        try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+
+        while (true)
+        {
+            var (avail, total, pctFree) = Cleaner.MemoryStats();
+            var autostart = TaskInstalled();
+
+            Console.WriteLine();
+            Console.WriteLine("============ MemCleaner 1.0 ============");
+            Console.WriteLine($"Свободно     : {avail / 1048576.0:F0} MB из {total / 1048576.0:F0} MB ({pctFree}%)");
+            Console.WriteLine($"Автозагрузка : {(autostart ? "ВКЛ" : "выкл")}");
+            Console.WriteLine($"Режим трея   : каждые {o.IntervalSec}с, чистить при <= {o.ThresholdPct}% свободной");
+            Console.WriteLine("----------------------------------------");
+            Console.WriteLine("  1 — Очистить память сейчас");
+            Console.WriteLine("  2 — Запустить в трее (фон, авто-чистка)");
+            Console.WriteLine("  3 — Включить автозагрузку");
+            Console.WriteLine("  4 — Выключить автозагрузку");
+            Console.WriteLine("  5 — Настройки (порог %, интервал сек)");
+            Console.WriteLine("  0 — Выход");
+            Console.Write("> ");
+
+            var key = Console.ReadLine()?.Trim();
+            if (key is null or "0") return 0;
+
+            switch (key)
+            {
+                case "1":
+                    Cleaner.Clean(Console.WriteLine);
+                    Pause();
+                    break;
+                case "2":
+                    StartTray(o);
+                    Pause();
+                    break;
+                case "3":
+                    Console.WriteLine(Install(o) == 0 ? "автозагрузка включена" : "не вышло (нужны права админа)");
+                    Pause();
+                    break;
+                case "4":
+                    Console.WriteLine(Uninstall() == 0 ? "автозагрузка выключена" : "ошибка");
+                    Pause();
+                    break;
+                case "5":
+                    Console.Write($"Порог свободной памяти % [{o.ThresholdPct}]: ");
+                    var t = Console.ReadLine()?.Trim();
+                    if (int.TryParse(t, out var tv)) o.ThresholdPct = tv;
+                    Console.Write($"Интервал сек [{o.IntervalSec}]: ");
+                    var iv = Console.ReadLine()?.Trim();
+                    if (int.TryParse(iv, out var ivv)) o.IntervalSec = ivv;
+                    Console.WriteLine("сохранено (вступит при следующем запуске трея/установке)");
+                    Pause();
+                    break;
+            }
+        }
+    }
+
+    static void Pause()
+    {
+        Console.WriteLine();
+        Console.Write("Enter — назад...");
+        Console.ReadLine();
+    }
+
+    static bool TaskInstalled()
+    {
+        var r = RunTool("schtasks", $"/query /tn \"{TaskName}\" /fo list");
+        return r.Contains(TaskName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static void StartTray(Options o)
+    {
+        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
+        var args = $"--tray --interval {o.IntervalSec} --threshold {o.ThresholdPct}";
+        try
+        {
+            Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = true });
+            Console.WriteLine("запущено — иконка в трее (правый клик: Clean now / Pause / Exit)");
+        }
+        catch (Exception ex) { Console.WriteLine($"ошибка запуска: {ex.Message}"); }
     }
 
     static void ShowHelp()
