@@ -2,3 +2,6 @@ bin/
 obj/
 out/
 *.user
+dist-new/
+dist/
+out/
