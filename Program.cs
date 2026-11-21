@@ -206,8 +206,8 @@ internal static class Program
 
     static bool TaskInstalled()
     {
-        var r = RunTool("schtasks", $"/query /tn \"{TaskName}\" /fo list");
-        return r.Contains(TaskName, StringComparison.OrdinalIgnoreCase);
+        var (_, code) = RunTool("schtasks", $"/query /tn \"{TaskName}\"");
+        return code == 0;
     }
 
     static void StartTray(Options o)
@@ -245,37 +245,42 @@ internal static class Program
     {
         var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
         var args = $"--tray --interval {o.IntervalSec} --threshold {o.ThresholdPct}";
-        var r = RunTool("schtasks",
-            $"/create /f /tn \"{TaskName}\" /tr \"\\\"{exe}\\\" {args}\" /sc onlogon /rl highest /delay 0000:30");
-        Console.WriteLine(r);
-        return r.Contains("SUCCESS") || r.Contains("успех") ? 0 : 1;
+        var (output, code) = RunTool("schtasks",
+            $"/create /f /tn \"{TaskName}\" /tr \"\\\"{exe}\\\" {args}\" /sc onlogon /rl highest");
+        Console.WriteLine(output);
+        return code == 0 ? 0 : 1;
     }
 
     static int Uninstall()
     {
-        var r = RunTool("schtasks", $"/delete /f /tn \"{TaskName}\"");
-        Console.WriteLine(r);
-        return 0;
+        var (o, code) = RunTool("schtasks", $"/delete /f /tn \"{TaskName}\"");
+        Console.WriteLine(code == 0 ? o : $"задача не найдена / ошибка: {o}");
+        return code;
     }
 
     static int ShowStatus()
     {
-        var r = RunTool("schtasks", $"/query /tn \"{TaskName}\" /fo list /v");
-        Console.WriteLine(string.IsNullOrWhiteSpace(r) ? "not installed" : r);
+        var (o, code) = RunTool("schtasks", $"/query /tn \"{TaskName}\" /fo list /v");
+        Console.WriteLine(code != 0 || string.IsNullOrWhiteSpace(o) ? "not installed" : o);
         return 0;
     }
 
-    static string RunTool(string exe, string args)
+    static (string Output, int Code) RunTool(string exe, string args)
     {
         try
         {
+            var enc = System.Text.Encoding.GetEncoding((int)Win32.GetOEMCP());
             var p = Process.Start(new ProcessStartInfo(exe, args)
-            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true })!;
+            {
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = enc, StandardErrorEncoding = enc,
+                UseShellExecute = false, CreateNoWindow = true,
+            })!;
             var o = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
             p.WaitForExit(15000);
-            return o.Trim();
+            return (o.Trim(), p.ExitCode);
         }
-        catch (Exception ex) { return ex.Message; }
+        catch (Exception ex) { return (ex.Message, -1); }
     }
 
     // ---------- privileges ----------

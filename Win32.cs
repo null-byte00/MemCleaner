@@ -21,6 +21,9 @@ internal static class Win32
     public const int STD_INPUT_HANDLE = -10;
     public const uint FILE_TYPE_CHAR = 0x0002;
 
+    [DllImport("kernel32.dll")]
+    public static extern uint GetOEMCP();
+
     // ---- privileges ----
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
