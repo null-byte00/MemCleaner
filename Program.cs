@@ -97,10 +97,12 @@ internal static class Program
             var (avail, total, pctFree) = Cleaner.MemoryStats();
             var autostart = TaskInstalled();
 
+            var admin = IsAdmin();
             Console.WriteLine();
             Console.WriteLine("============ MemCleaner 1.0 ============");
             Console.WriteLine($"Свободно     : {avail / 1048576.0:F0} MB из {total / 1048576.0:F0} MB ({pctFree}%)");
             Console.WriteLine($"Автозагрузка : {(autostart ? "ВКЛ" : "выкл")}");
+            Console.WriteLine($"Режим        : {(admin ? "администратор (полная чистка)" : "обычный (без standby/cached)")}");
             Console.WriteLine($"Режим трея   : каждые {o.IntervalSec}с, чистить при <= {o.ThresholdPct}% свободной");
             Console.WriteLine("----------------------------------------");
             Console.WriteLine("  1 — Очистить память сейчас");
@@ -108,6 +110,7 @@ internal static class Program
             Console.WriteLine("  3 — Включить автозагрузку");
             Console.WriteLine("  4 — Выключить автозагрузку");
             Console.WriteLine("  5 — Настройки (порог %, интервал сек)");
+            if (!admin) Console.WriteLine("  6 — Перезапуск от администратора (UAC)");
             Console.WriteLine("  0 — Выход");
             Console.Write("> ");
 
@@ -125,7 +128,20 @@ internal static class Program
                     Pause();
                     break;
                 case "3":
-                    Console.WriteLine(Install(o) == 0 ? "автозагрузка включена" : "не вышло (нужны права админа)");
+                    if (!admin)
+                    {
+                        // перезапуск себя elevated — UAC по явному выбору пользователя
+                        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo(exe,
+                                $"--install --interval {o.IntervalSec} --threshold {o.ThresholdPct}")
+                            { UseShellExecute = true, Verb = "runas" });
+                            Console.WriteLine("подтверди UAC — задача будет создана от администратора");
+                        }
+                        catch { Console.WriteLine("отменено"); }
+                    }
+                    else Console.WriteLine(Install(o) == 0 ? "автозагрузка включена" : "не вышло");
                     Pause();
                     break;
                 case "4":
@@ -142,8 +158,29 @@ internal static class Program
                     Console.WriteLine("сохранено (вступит при следующем запуске трея/установке)");
                     Pause();
                     break;
+                case "6":
+                    if (!admin) { RestartAsAdmin(); return 0; }
+                    break;
             }
         }
+    }
+
+    static bool IsAdmin()
+    {
+        try
+        {
+            using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+            return new System.Security.Principal.WindowsPrincipal(id)
+                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
+    }
+
+    static void RestartAsAdmin()
+    {
+        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
+        try { Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, Verb = "runas" }); }
+        catch { }
     }
 
     static void Pause()
@@ -165,7 +202,10 @@ internal static class Program
         var args = $"--tray --interval {o.IntervalSec} --threshold {o.ThresholdPct}";
         try
         {
-            Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = true });
+            // без прав — трей стартует ограниченным; с правами — полноценным (UAC по выбору юзера)
+            var psi = new ProcessStartInfo(exe, args) { UseShellExecute = true };
+            if (!IsAdmin()) psi.Verb = "runas";
+            Process.Start(psi);
             Console.WriteLine("запущено — иконка в трее (правый клик: Clean now / Pause / Exit)");
         }
         catch (Exception ex) { Console.WriteLine($"ошибка запуска: {ex.Message}"); }
