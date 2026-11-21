@@ -12,6 +12,15 @@ internal static class Win32
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool AllocConsole();
 
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetStdHandle(int which);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetFileType(IntPtr handle);
+
+    public const int STD_INPUT_HANDLE = -10;
+    public const uint FILE_TYPE_CHAR = 0x0002;
+
     // ---- privileges ----
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);

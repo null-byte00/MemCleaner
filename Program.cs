@@ -88,9 +88,23 @@ internal static class Program
     // ---------- интерактивное меню ----------
     static int RunMenu(Options o)
     {
-        if (!Console.IsOutputRedirected && !Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS))
-            Win32.AllocConsole();
-        try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+        // GUI-экзешник: консоль надо создать самому. IsInputRedirected врёт для
+        // GUI (хэндл NULL), поэтому смотрим тип реального хэндла stdin:
+        // NULL → консоли нет вообще (аллоцируем), FILE_TYPE_CHAR → живая консоль,
+        // pipe/file → stdin из пайпа, окно не нужно.
+        var inH = Win32.GetStdHandle(Win32.STD_INPUT_HANDLE);
+        var piped = inH != IntPtr.Zero && Win32.GetFileType(inH) != Win32.FILE_TYPE_CHAR;
+        if (!piped)
+        {
+            if (!Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS))
+                Win32.AllocConsole();
+            // потоки могли закешироваться без консоли — перепривязываем на реальные хэндлы
+            Console.SetIn(new StreamReader(Console.OpenStandardInput()));
+            var cout = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+            Console.SetOut(cout);
+            Console.SetError(cout);
+            try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+        }
 
         while (true)
         {
