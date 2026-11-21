@@ -5,158 +5,141 @@ namespace MemCleaner;
 
 internal static class Program
 {
-    // SystemMemoryListInformation
-    const int SystemMemoryListInformationClass = 0x50;
-    const int MemoryFlushModifiedList = 3;
-    const int MemoryPurgeStandbyList = 4;
-    const int MemoryPurgeLowPriorityStandbyList = 5;
-
-    const uint PROCESS_SET_QUOTA = 0x0100;
-    const uint PROCESS_QUERY_INFORMATION = 0x0400;
-    const uint FILE_CACHE_MAX_HARD_ENABLE = 1;
-
-    const uint TOKEN_ADJUST_PRIVILEGES = 0x20;
-    const uint TOKEN_QUERY = 0x08;
-    const uint SE_PRIVILEGE_ENABLED = 0x2;
-
-    [DllImport("ntdll.dll")]
-    static extern int NtSetSystemInformation(int infoClass, ref int command, int commandLen);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool CloseHandle(IntPtr handle);
-
-    [DllImport("psapi.dll", SetLastError = true)]
-    static extern bool EmptyWorkingSet(IntPtr hProcess);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool SetSystemFileCacheSize(IntPtr min, IntPtr max, uint flags);
-
-    [DllImport("kernel32.dll")]
-    static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx s);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool LookupPrivilegeValue(string? system, string name, out long luid);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll,
-        ref TokenPrivileges privileges, int length, IntPtr prev, IntPtr retLen);
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct MemoryStatusEx
+    // ---------- args ----------
+    internal sealed class Options
     {
-        public uint Length;
-        public uint MemoryLoad;
-        public ulong TotalPhys, AvailPhys, TotalPageFile, AvailPageFile;
-        public ulong TotalVirtual, AvailVirtual, AvailExtendedVirtual;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct TokenPrivileges
-    {
-        public uint Count;
-        public long Luid;
-        public uint Attributes;
-    }
-
-    static ulong AvailableBytes()
-    {
-        var s = new MemoryStatusEx { Length = (uint)Marshal.SizeOf<MemoryStatusEx>() };
-        GlobalMemoryStatusEx(ref s);
-        return s.AvailPhys;
-    }
-
-    static void EnablePrivilege(string name)
-    {
-        try
-        {
-            if (!OpenProcessToken(Process.GetCurrentProcess().Handle,
-                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out var tok)) return;
-            if (!LookupPrivilegeValue(null, name, out var luid)) { CloseHandle(tok); return; }
-            var tp = new TokenPrivileges { Count = 1, Luid = luid, Attributes = SE_PRIVILEGE_ENABLED };
-            AdjustTokenPrivileges(tok, false, ref tp, Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
-            CloseHandle(tok);
-        }
-        catch { }
-    }
-
-    static int EmptyAllWorkingSets()
-    {
-        int done = 0;
-        foreach (var p in Process.GetProcesses())
-        {
-            try
-            {
-                var h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, false, p.Id);
-                if (h == IntPtr.Zero) continue;
-                try { if (EmptyWorkingSet(h)) done++; }
-                finally { CloseHandle(h); }
-            }
-            catch { }
-            finally { p.Dispose(); }
-        }
-        return done;
-    }
-
-    static bool SystemListCommand(int command)
-    {
-        var cmd = command;
-        return NtSetSystemInformation(SystemMemoryListInformationClass, ref cmd, sizeof(int)) == 0;
-    }
-
-    static double Mb(ulong b) => b / 1048576.0;
-    static double Delta(ulong after, ulong before) => ((long)after - (long)before) / 1048576.0;
-
-    static int Clean()
-    {
-        var before = AvailableBytes();
-
-        var procs = EmptyAllWorkingSets();
-        var afterWs = AvailableBytes();
-        Console.WriteLine($"working sets : trimmed {procs} processes   ({Delta(afterWs, before):+0;-0;0} MB)");
-
-        var okMod = SystemListCommand(MemoryFlushModifiedList);
-        var okStandby = SystemListCommand(MemoryPurgeStandbyList);
-        var okLow = SystemListCommand(MemoryPurgeLowPriorityStandbyList);
-        var afterList = AvailableBytes();
-        Console.WriteLine($"standby+mod  : {(okMod && okStandby ? "purged" : "FAILED - run as admin")}           ({Delta(afterList, afterWs):+0;-0;0} MB)");
-
-        SetSystemFileCacheSize(new IntPtr(-1), new IntPtr(-1), FILE_CACHE_MAX_HARD_ENABLE);
-        var afterFc = AvailableBytes();
-        Console.WriteLine($"file cache   : flushed                  ({Delta(afterFc, afterList):+0;-0;0} MB)");
-
-        Console.WriteLine($"---");
-        Console.WriteLine($"available    : {Mb(before):F0} MB -> {Mb(afterFc):F0} MB  (freed {Delta(afterFc, before):+0;-0;0} MB)");
-        return 0;
+        public bool Tray, Watch, Install, Uninstall, Status, Help;
+        public int IntervalSec = 60;
+        public int ThresholdPct = 25;   // чистить только когда свободно <= N%
+        public string LogPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MemCleaner", "log.txt");
     }
 
     static int Main(string[] args)
     {
-        foreach (var priv in new[]
+        var o = new Options();
+        for (int i = 0; i < args.Length; i++)
         {
-            "SeIncreaseQuotaPrivilege",   // SetSystemFileCacheSize
-            "SeProfileSingleProcessPrivilege", // memory list commands
-            "SeDebugPrivilege",           // open more processes
-            "SeLockMemoryPrivilege",
-        }) EnablePrivilege(priv);
-
-        if (args.Length >= 2 && args[0] is "--watch" or "-w" &&
-            int.TryParse(args[1], out var sec) && sec > 0)
-        {
-            Console.WriteLine($"watch mode: clean every {sec}s (Ctrl+C to quit)");
-            while (true)
+            switch (args[i])
             {
-                Clean();
-                Thread.Sleep(TimeSpan.FromSeconds(sec));
-                Console.WriteLine();
+                case "--tray": o.Tray = true; break;
+                case "--install": o.Install = true; break;
+                case "--uninstall": o.Uninstall = true; break;
+                case "--status": o.Status = true; break;
+                case "-h": case "--help": o.Help = true; break;
+                case "--watch": case "-w": o.Watch = true; break;
+                case "--interval": case "-i":
+                    if (i + 1 < args.Length) int.TryParse(args[++i], out o.IntervalSec); break;
+                case "--threshold": case "-t":
+                    if (i + 1 < args.Length) int.TryParse(args[++i], out o.ThresholdPct); break;
             }
         }
 
-        return Clean();
+        if (o.Help) { ShowHelp(); return 0; }
+        if (o.Install) return Install(o);
+        if (o.Uninstall) return Uninstall();
+        if (o.Status) return ShowStatus();
+
+        EnablePrivileges();
+
+        if (o.Tray)
+            return TrayApp.Run(o);   // без консоли
+
+        // консольный режим: подцепиться к родительской консоли или создать свою
+        var attached = Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS);
+        var allocated = !attached && Win32.AllocConsole();
+        if (attached || allocated)
+        {
+            Console.WriteLine("MemCleaner 0.2");
+            if (o.Watch)
+            {
+                Console.WriteLine($"watch: check every {o.IntervalSec}s, clean when free <= {o.ThresholdPct}%  (Ctrl+C — выход)");
+                Console.WriteLine();
+                while (true)
+                {
+                    var (_, _, pctFree) = Cleaner.MemoryStats();
+                    if (o.ThresholdPct == 0 || pctFree <= o.ThresholdPct)
+                        Cleaner.Clean(Console.WriteLine);
+                    else
+                        Console.WriteLine($"{DateTime.Now:HH:mm:ss} free {pctFree}% — above threshold, skip");
+                    Thread.Sleep(TimeSpan.FromSeconds(o.IntervalSec));
+                    Console.WriteLine();
+                }
+            }
+            Cleaner.Clean(Console.WriteLine);
+            if (allocated)
+            {
+                Console.WriteLine();
+                Console.Write("press any key...");
+                Console.ReadKey(true);
+            }
+        }
+        return 0;
+    }
+
+    static void ShowHelp()
+    {
+        Console.WriteLine(
+            "MemCleaner.exe                 clean once (console)\n" +
+            "MemCleaner.exe --watch         clean in a loop, console\n" +
+            "MemCleaner.exe --tray          tray icon + auto-clean\n" +
+            "  --interval N / -i N          seconds between checks (default 60)\n" +
+            "  --threshold N / -t N         clean only when free RAM <= N% (default 25; 0 = always)\n" +
+            "MemCleaner.exe --install       add to autostart (Task Scheduler, elevated)\n" +
+            "MemCleaner.exe --uninstall     remove from autostart\n" +
+            "MemCleaner.exe --status        show autostart state");
+    }
+
+    // ---------- autostart (Task Scheduler: тихий elevated-запуск при логине) ----------
+    const string TaskName = "MemCleaner";
+
+    static int Install(Options o)
+    {
+        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
+        var args = $"--tray --interval {o.IntervalSec} --threshold {o.ThresholdPct}";
+        var r = RunTool("schtasks",
+            $"/create /f /tn \"{TaskName}\" /tr \"\\\"{exe}\\\" {args}\" /sc onlogon /rl highest /delay 0000:30");
+        Console.WriteLine(r);
+        return r.Contains("SUCCESS") || r.Contains("успех") ? 0 : 1;
+    }
+
+    static int Uninstall()
+    {
+        var r = RunTool("schtasks", $"/delete /f /tn \"{TaskName}\"");
+        Console.WriteLine(r);
+        return 0;
+    }
+
+    static int ShowStatus()
+    {
+        var r = RunTool("schtasks", $"/query /tn \"{TaskName}\" /fo list /v");
+        Console.WriteLine(string.IsNullOrWhiteSpace(r) ? "not installed" : r);
+        return 0;
+    }
+
+    static string RunTool(string exe, string args)
+    {
+        try
+        {
+            var p = Process.Start(new ProcessStartInfo(exe, args)
+            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true })!;
+            var o = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+            p.WaitForExit(15000);
+            return o.Trim();
+        }
+        catch (Exception ex) { return ex.Message; }
+    }
+
+    // ---------- privileges ----------
+    internal static void EnablePrivileges()
+    {
+        foreach (var priv in new[]
+        {
+            "SeIncreaseQuotaPrivilege",
+            "SeProfileSingleProcessPrivilege",
+            "SeDebugPrivilege",
+            "SeLockMemoryPrivilege",
+        }) Win32.EnablePrivilege(priv);
     }
 }
