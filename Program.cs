@@ -16,9 +16,26 @@ internal static class Program
             "MemCleaner", "log.txt");
     }
 
+    static Mutex? _single;
+    static string _logFile = "";
+
+    internal static void Dbg(string msg)
+    {
+        try
+        {
+            var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{Environment.ProcessId}] {msg}";
+            File.AppendAllText(_logFile, line + Environment.NewLine);
+        }
+        catch { }
+    }
+
     static int Main(string[] args)
     {
+        System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
         var o = new Options();
+        _logFile = o.LogPath;
+        try { Directory.CreateDirectory(Path.GetDirectoryName(_logFile)!); } catch { }
+        Dbg($"=== start, args=[{string.Join(' ', args)}] admin={IsAdmin()}");
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -37,6 +54,22 @@ internal static class Program
         }
 
         if (o.Help) { ShowHelp(); return 0; }
+
+        // всегда работаем от администратора: без прав — перезапуск через UAC
+        if (!IsAdmin() && (args.Length == 0 || o.Tray || o.Watch || o.Install || o.Uninstall))
+        {
+            Dbg("не админ — перезапуск через runas");
+            var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
+            try
+            {
+                Process.Start(new ProcessStartInfo(exe, string.Join(' ', args))
+                { UseShellExecute = true, Verb = "runas" });
+                Dbg("elevated-копия запущена, выхожу");
+                return 0;
+            }
+            catch (Exception ex) { Dbg($"runas отменён: {ex.Message} — продолжаю без прав"); }
+        }
+
         if (o.Install) return Install(o);
         if (o.Uninstall) return Uninstall();
         if (o.Status) return ShowStatus();
@@ -44,14 +77,26 @@ internal static class Program
         EnablePrivileges();
 
         if (o.Tray)
+        {
+            _single = new Mutex(true, @"Local\MemCleanerTray", out var fresh);
+            if (!fresh) { Dbg("tray уже запущен — выход"); return 0; }
             return TrayApp.Run(o);   // без консоли
+        }
 
         // без флагов — интерактивное меню; --watch — консольный цикл
         if (!o.Watch && args.Length == 0)
+        {
+            _single = new Mutex(true, @"Local\MemCleanerUI", out var fresh);
+            if (!fresh)
+            {
+                // второе окно меню не нужно — тихий выход
+                Dbg("меню уже открыто — выход");
+                if (Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS))
+                    Console.WriteLine("MemCleaner уже запущен.");
+                return 0;
+            }
             return RunMenu(o);
-
-        if (o.Tray)
-            return TrayApp.Run(o);   // без консоли
+        }
 
         // консольный режим: подцепиться к родительской консоли или создать свою
         var attached = Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS);
@@ -112,6 +157,7 @@ internal static class Program
             var autostart = TaskInstalled();
 
             var admin = IsAdmin();
+            try { Console.Clear(); } catch { }
             Console.WriteLine();
             Console.WriteLine("============ MemCleaner 1.0 ============");
             Console.WriteLine($"Свободно     : {avail / 1048576.0:F0} MB из {total / 1048576.0:F0} MB ({pctFree}%)");
@@ -129,12 +175,14 @@ internal static class Program
             Console.Write("> ");
 
             var key = Console.ReadLine()?.Trim();
+            Dbg($"menu: выбор '{key}'");
             if (key is null or "0") return 0;
 
             switch (key)
             {
                 case "1":
                     Cleaner.Clean(Console.WriteLine);
+                    Dbg("menu: чистка выполнена");
                     Pause();
                     break;
                 case "2":
@@ -245,8 +293,10 @@ internal static class Program
     {
         var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
         var args = $"--tray --interval {o.IntervalSec} --threshold {o.ThresholdPct}";
-        var (output, code) = RunTool("schtasks",
-            $"/create /f /tn \"{TaskName}\" /tr \"\\\"{exe}\\\" {args}\" /sc onlogon /rl highest");
+        var cmd = $"/create /f /tn \"{TaskName}\" /tr \"\\\"{exe}\\\" {args}\" /sc onlogon /rl highest";
+        Dbg($"schtasks {cmd}");
+        var (output, code) = RunTool("schtasks", cmd);
+        Dbg($"schtasks exit={code} out={output}");
         Console.WriteLine(output);
         return code == 0 ? 0 : 1;
     }
@@ -254,6 +304,7 @@ internal static class Program
     static int Uninstall()
     {
         var (o, code) = RunTool("schtasks", $"/delete /f /tn \"{TaskName}\"");
+        Dbg($"schtasks delete exit={code} out={o}");
         Console.WriteLine(code == 0 ? o : $"задача не найдена / ошибка: {o}");
         return code;
     }
