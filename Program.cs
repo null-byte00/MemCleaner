@@ -11,9 +11,49 @@ internal static class Program
         public bool Tray, Watch, Install, Uninstall, Status, Help;
         public int IntervalSec = 60;
         public int ThresholdPct = 25;   // чистить только когда свободно <= N%
+        public List<string> Exclusions = ["ClipBar", "ffmpeg", "ffprobe", "javaw", "java", "MemCleaner"];
         public string LogPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "MemCleaner", "log.txt");
+
+        public static string SettingsPath => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MemCleaner", "settings.json");
+
+        sealed class Persisted
+        {
+            public int IntervalSec { get; set; } = 60;
+            public int ThresholdPct { get; set; } = 25;
+            public List<string>? Exclusions { get; set; }
+        }
+
+        public static Options Load()
+        {
+            var o = new Options();
+            try
+            {
+                if (!File.Exists(SettingsPath)) return o;
+                var p = System.Text.Json.JsonSerializer.Deserialize<Persisted>(File.ReadAllText(SettingsPath));
+                if (p is null) return o;
+                if (p.IntervalSec > 0) o.IntervalSec = p.IntervalSec;
+                if (p.ThresholdPct >= 0) o.ThresholdPct = p.ThresholdPct;
+                if (p.Exclusions is { Count: > 0 }) o.Exclusions = p.Exclusions;
+            }
+            catch { }
+            return o;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+                File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(
+                    new Persisted { IntervalSec = IntervalSec, ThresholdPct = ThresholdPct, Exclusions = Exclusions },
+                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch { }
+        }
     }
 
     static Mutex? _single;
@@ -32,8 +72,9 @@ internal static class Program
     static int Main(string[] args)
     {
         System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
-        var o = new Options();
+        var o = Options.Load();
         _logFile = o.LogPath;
+        Cleaner.SkipNames = new HashSet<string>(o.Exclusions, StringComparer.OrdinalIgnoreCase);
         try { Directory.CreateDirectory(Path.GetDirectoryName(_logFile)!); } catch { }
         Dbg($"=== start, args=[{string.Join(' ', args)}] admin={IsAdmin()}");
         for (int i = 0; i < args.Length; i++)
@@ -168,6 +209,8 @@ internal static class Program
                 ("Запустить в трее (фон, авто-чистка)", () => { StartTray(o); Pause(); return Task.FromResult(false); }),
                 (autostart ? "Автозагрузка: ВКЛ — выключить" : "Автозагрузка: выкл — включить", () => Task.FromResult(ActAutostart(o, autostart, admin))),
                 ("Настройки (порог %, интервал сек)", () => { ActSettings(o); return Task.FromResult(false); }),
+                ($"Исключения процессов ({o.Exclusions.Count})", () => { ActExclusions(o); return Task.FromResult(false); }),
+                ("История чисток", () => { ActHistory(); return Task.FromResult(false); }),
                 (upd is not null ? $"Обновить до v{upd.ToString(3)}" : "Проверить обновление", ActUpdate),
             };
             if (!admin) items.Add(("Перезапуск от администратора (UAC)", () => { RestartAsAdmin(); return Task.FromResult(true); }));
@@ -269,7 +312,55 @@ internal static class Program
         Console.Write($"Интервал сек [{o.IntervalSec}]: ");
         var iv = Console.ReadLine()?.Trim();
         if (int.TryParse(iv, out var ivv)) o.IntervalSec = ivv;
-        Console.WriteLine("сохранено (вступит при следующем запуске трея/установке)");
+        o.Save();
+        Console.WriteLine("сохранено в settings.json");
+        Pause();
+    }
+
+    static void ActExclusions(Options o)
+    {
+        while (true)
+        {
+            try { Console.Clear(); } catch { }
+            Console.WriteLine("Исключения — этим процессам память не режем:");
+            for (int i = 0; i < o.Exclusions.Count; i++)
+                Console.WriteLine($"  {i + 1,2}. {o.Exclusions[i]}");
+            Console.WriteLine();
+            Console.WriteLine("  +имя — добавить   ·   -N — убрать   ·   Enter — назад");
+            Console.Write("> ");
+            var s = Console.ReadLine()?.Trim();
+            if (string.IsNullOrEmpty(s)) { o.Save(); Cleaner.SkipNames = new HashSet<string>(o.Exclusions, StringComparer.OrdinalIgnoreCase); return; }
+            if (s.StartsWith('+') && s.Length > 1)
+            {
+                var name = s[1..].Trim();
+                if (!o.Exclusions.Contains(name, StringComparer.OrdinalIgnoreCase)) { o.Exclusions.Add(name); Dbg($"exclusions: +{name}"); }
+            }
+            else if (s.StartsWith('-') && int.TryParse(s[1..], out var n) && n >= 1 && n <= o.Exclusions.Count)
+            {
+                Dbg($"exclusions: -{o.Exclusions[n - 1]}");
+                o.Exclusions.RemoveAt(n - 1);
+            }
+            else if (int.TryParse(s, out var d) && d >= 1 && d <= o.Exclusions.Count)
+            {
+                Dbg($"exclusions: -{o.Exclusions[d - 1]}");
+                o.Exclusions.RemoveAt(d - 1);
+            }
+        }
+    }
+
+    static void ActHistory()
+    {
+        try { Console.Clear(); } catch { }
+        Console.WriteLine("Последние чистки:");
+        try
+        {
+            var lines = File.Exists(_logFile) ? File.ReadAllLines(_logFile) : [];
+            var cleans = lines.Where(l => l.Contains("clean: freed") || l.Contains("чистка выполнена"))
+                              .TakeLast(15).ToList();
+            if (cleans.Count == 0) Console.WriteLine("  пока пусто");
+            foreach (var l in cleans) Console.WriteLine("  " + l.Trim());
+        }
+        catch (Exception ex) { Console.WriteLine("  не удалось прочитать лог: " + ex.Message); }
         Pause();
     }
 

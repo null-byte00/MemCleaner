@@ -49,8 +49,9 @@ internal static class Cleaner
         return (s.AvailPhys, s.TotalPhys, pct);
     }
 
-    // процессы, чьи рабочие наборы не трогаем — запись/кодирование не должно фризить
-    static readonly HashSet<string> SkipNames = new(StringComparer.OrdinalIgnoreCase)
+    // процессы, чьи рабочие наборы не трогаем — запись/кодирование не должно фризить.
+    // редактируется из меню «Исключения» (settings.json)
+    internal static volatile HashSet<string> SkipNames = new(StringComparer.OrdinalIgnoreCase)
         { "ClipBar", "ffmpeg", "ffprobe", "javaw", "java", "MemCleaner" };
 
     static int EmptyAllWorkingSets()
