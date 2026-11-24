@@ -78,24 +78,23 @@ internal static class Program
 
         if (o.Tray)
         {
-            _single = new Mutex(true, @"Local\MemCleanerTray", out var fresh);
-            if (!fresh) { Dbg("tray уже запущен — выход"); return 0; }
+            _single = TakeMutex(@"Local\MemCleanerTray");
+            if (_single is null) { Dbg("tray уже запущен и не убивается — выход"); return 0; }
             return TrayApp.Run(o);   // без консоли
         }
 
         // без флагов — интерактивное меню; --watch — консольный цикл
         if (!o.Watch && args.Length == 0)
         {
-            _single = new Mutex(true, @"Local\MemCleanerUI", out var fresh);
-            if (!fresh)
+            _single = TakeMutex(@"Local\MemCleanerUI");
+            if (_single is null)
             {
-                // второе окно меню не нужно — тихий выход
-                Dbg("меню уже открыто — выход");
+                Dbg("меню уже открыто и не убивается — выход");
                 if (Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS))
                     Console.WriteLine("MemCleaner уже запущен.");
                 return 0;
             }
-            return RunMenu(o);
+            return RunMenu(o).GetAwaiter().GetResult();
         }
 
         // консольный режим: подцепиться к родительской консоли или создать свою
@@ -130,8 +129,8 @@ internal static class Program
         return 0;
     }
 
-    // ---------- интерактивное меню ----------
-    static int RunMenu(Options o)
+    // ---------- интерактивное меню (стрелки + Enter) ----------
+    static async Task<int> RunMenu(Options o)
     {
         // GUI-экзешник: консоль надо создать самому. IsInputRedirected врёт для
         // GUI (хэндл NULL), поэтому смотрим тип реального хэндла stdin:
@@ -139,6 +138,7 @@ internal static class Program
         // pipe/file → stdin из пайпа, окно не нужно.
         var inH = Win32.GetStdHandle(Win32.STD_INPUT_HANDLE);
         var piped = inH != IntPtr.Zero && Win32.GetFileType(inH) != Win32.FILE_TYPE_CHAR;
+        pipedConsole = piped;
         if (!piped)
         {
             if (!Win32.AttachConsole(Win32.ATTACH_PARENT_PROCESS))
@@ -151,80 +151,194 @@ internal static class Program
             try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
         }
 
+        // фоновая проверка обновления — строка появится при следующей перерисовке
+        _ = Task.Run(() => Updater.CheckAsync());
+
+        var sel = 0;
         while (true)
         {
             var (avail, total, pctFree) = Cleaner.MemoryStats();
             var autostart = TaskInstalled();
-
             var admin = IsAdmin();
+            var upd = Updater.Latest;
+
+            var items = new List<(string Label, Func<Task<bool>> Act)>
+            {
+                ("Очистить память сейчас", () => Task.FromResult(ActClean())),
+                ("Запустить в трее (фон, авто-чистка)", () => { StartTray(o); Pause(); return Task.FromResult(false); }),
+                (autostart ? "Автозагрузка: ВКЛ — выключить" : "Автозагрузка: выкл — включить", () => Task.FromResult(ActAutostart(o, autostart, admin))),
+                ("Настройки (порог %, интервал сек)", () => { ActSettings(o); return Task.FromResult(false); }),
+                (upd is not null ? $"Обновить до v{upd.ToString(3)}" : "Проверить обновление", ActUpdate),
+            };
+            if (!admin) items.Add(("Перезапуск от администратора (UAC)", () => { RestartAsAdmin(); return Task.FromResult(true); }));
+            items.Add(("Выход", () => Task.FromResult(true)));
+            sel = Math.Clamp(sel, 0, items.Count - 1);
+
             try { Console.Clear(); } catch { }
             Console.WriteLine();
-            Console.WriteLine("============ MemCleaner 1.0 ============");
+            Console.WriteLine($"============ MemCleaner {Updater.Current.ToString(3)} ============");
             Console.WriteLine($"Свободно     : {avail / 1048576.0:F0} MB из {total / 1048576.0:F0} MB ({pctFree}%)");
             Console.WriteLine($"Автозагрузка : {(autostart ? "ВКЛ" : "выкл")}");
             Console.WriteLine($"Режим        : {(admin ? "администратор (полная чистка)" : "обычный (без standby/cached)")}");
             Console.WriteLine($"Режим трея   : каждые {o.IntervalSec}с, чистить при <= {o.ThresholdPct}% свободной");
+            if (upd is not null)
+                Console.WriteLine($"Обновление   : доступна v{upd.ToString(3)}!");
             Console.WriteLine("----------------------------------------");
-            Console.WriteLine("  1 — Очистить память сейчас");
-            Console.WriteLine("  2 — Запустить в трее (фон, авто-чистка)");
-            Console.WriteLine("  3 — Включить автозагрузку");
-            Console.WriteLine("  4 — Выключить автозагрузку");
-            Console.WriteLine("  5 — Настройки (порог %, интервал сек)");
-            if (!admin) Console.WriteLine("  6 — Перезапуск от администратора (UAC)");
-            Console.WriteLine("  0 — Выход");
-            Console.Write("> ");
-
-            var key = Console.ReadLine()?.Trim();
-            Dbg($"menu: выбор '{key}'");
-            if (key is null or "0") return 0;
-
-            switch (key)
+            for (int i = 0; i < items.Count; i++)
             {
-                case "1":
-                    Cleaner.Clean(Console.WriteLine);
-                    Dbg("menu: чистка выполнена");
-                    Pause();
+                if (i == sel)
+                {
+                    Console.ForegroundColor = ConsoleColor.Black;
+                    Console.BackgroundColor = ConsoleColor.White;
+                    Console.WriteLine($"> {items[i].Label}");
+                    Console.ResetColor();
+                }
+                else Console.WriteLine($"  {items[i].Label}");
+            }
+            Console.WriteLine("----------------------------------------");
+            Console.WriteLine("  стрелки ↑↓ — выбор, Enter — выполнить");
+
+            if (piped)
+            {
+                // stdin из пайпа — стрелки недоступны, оставляем ввод номером
+                var key = Console.ReadLine()?.Trim();
+                if (key is null) return 0;
+                if (int.TryParse(key, out var n) && n >= 1 && n <= items.Count)
+                {
+                    if (await items[n - 1].Act()) return 0;
+                }
+                else return 0;
+                continue;
+            }
+
+            var k = Console.ReadKey(true);
+            Dbg($"menu: key {k.Key}");
+            switch (k.Key)
+            {
+                case ConsoleKey.UpArrow: sel = (sel - 1 + items.Count) % items.Count; break;
+                case ConsoleKey.DownArrow: sel = (sel + 1) % items.Count; break;
+                case ConsoleKey.Enter:
+                    Dbg($"menu: выбор '{items[sel].Label}'");
+                    if (await items[sel].Act()) return 0;
                     break;
-                case "2":
-                    StartTray(o);
-                    Pause();
-                    break;
-                case "3":
-                    if (!admin)
-                    {
-                        // перезапуск себя elevated — UAC по явному выбору пользователя
-                        var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
-                        try
-                        {
-                            Process.Start(new ProcessStartInfo(exe,
-                                $"--install --interval {o.IntervalSec} --threshold {o.ThresholdPct}")
-                            { UseShellExecute = true, Verb = "runas" });
-                            Console.WriteLine("подтверди UAC — задача будет создана от администратора");
-                        }
-                        catch { Console.WriteLine("отменено"); }
-                    }
-                    else Console.WriteLine(Install(o) == 0 ? "автозагрузка включена" : "не вышло");
-                    Pause();
-                    break;
-                case "4":
-                    Console.WriteLine(Uninstall() == 0 ? "автозагрузка выключена" : "ошибка");
-                    Pause();
-                    break;
-                case "5":
-                    Console.Write($"Порог свободной памяти % [{o.ThresholdPct}]: ");
-                    var t = Console.ReadLine()?.Trim();
-                    if (int.TryParse(t, out var tv)) o.ThresholdPct = tv;
-                    Console.Write($"Интервал сек [{o.IntervalSec}]: ");
-                    var iv = Console.ReadLine()?.Trim();
-                    if (int.TryParse(iv, out var ivv)) o.IntervalSec = ivv;
-                    Console.WriteLine("сохранено (вступит при следующем запуске трея/установке)");
-                    Pause();
-                    break;
-                case "6":
-                    if (!admin) { RestartAsAdmin(); return 0; }
-                    break;
+                case ConsoleKey.Escape:
+                    return 0;
             }
         }
+    }
+
+    static bool ActClean()
+    {
+        Cleaner.Clean(Console.WriteLine);
+        Dbg("menu: чистка выполнена");
+        Pause();
+        return false;
+    }
+
+    static bool ActAutostart(Options o, bool installed, bool admin)
+    {
+        if (installed)
+        {
+            Console.WriteLine(Uninstall() == 0 ? "автозагрузка выключена" : "ошибка");
+            Pause();
+            return false;
+        }
+        if (!admin)
+        {
+            // перезапуск себя elevated — UAC по явному выбору пользователя
+            var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule!.FileName!;
+            try
+            {
+                Process.Start(new ProcessStartInfo(exe,
+                    $"--install --interval {o.IntervalSec} --threshold {o.ThresholdPct}")
+                { UseShellExecute = true, Verb = "runas" });
+                Console.WriteLine("подтверди UAC — задача будет создана от администратора");
+            }
+            catch { Console.WriteLine("отменено"); }
+        }
+        else Console.WriteLine(Install(o) == 0 ? "автозагрузка включена" : "не вышло");
+        Pause();
+        return false;
+    }
+
+    static void ActSettings(Options o)
+    {
+        Console.Write($"Порог свободной памяти % [{o.ThresholdPct}]: ");
+        var t = Console.ReadLine()?.Trim();
+        if (int.TryParse(t, out var tv)) o.ThresholdPct = tv;
+        Console.Write($"Интервал сек [{o.IntervalSec}]: ");
+        var iv = Console.ReadLine()?.Trim();
+        if (int.TryParse(iv, out var ivv)) o.IntervalSec = ivv;
+        Console.WriteLine("сохранено (вступит при следующем запуске трея/установке)");
+        Pause();
+    }
+
+    static async Task<bool> ActUpdate()
+    {
+        Console.WriteLine("Проверяю github…");
+        var v = await Updater.CheckAsync();
+        if (v is null)
+        {
+            Console.WriteLine($"У тебя последняя версия — {Updater.Current.ToString(3)}");
+            Pause();
+            return false;
+        }
+        Console.WriteLine($"Качаю v{v.ToString(3)}…");
+        if (!await Updater.DownloadAsync())
+        {
+            Console.WriteLine("не удалось скачать — проверь интернет");
+            Pause();
+            return false;
+        }
+        Console.WriteLine("Готово. Enter — обновить и перезапустить (Esc — позже)");
+        var k = pipedConsole ? new ConsoleKeyInfo('\r', ConsoleKey.Enter, false, false, false) : Console.ReadKey(true);
+        if (k.Key == ConsoleKey.Enter) Updater.ApplyAndExit();  // не возвращается
+        return false;
+    }
+
+    static bool pipedConsole;
+
+    // мьютекс с takeover: если старый экземпляр держит имя — убиваем его и занимаем.
+    // второй раз окно просто так не блокируется (зависшие/зомби-процессы не мешают).
+    static Mutex? TakeMutex(string name)
+    {
+        var m = new Mutex(true, name, out var fresh);
+        if (fresh) return m;
+        Dbg($"{name}: занят — убиваю старые экземпляры");
+        m.Dispose();
+        var wantTray = name.EndsWith("Tray", StringComparison.Ordinal);
+        foreach (var p in Process.GetProcessesByName("MemCleaner"))
+        {
+            if (p.Id == Environment.ProcessId) continue;
+            // убиваем только копию того же режима: трей не трогаем при открытии меню и наоборот
+            var isTray = IsTrayProcess(p);
+            if (isTray != wantTray) { p.Dispose(); continue; }
+            try { Dbg($"kill old PID {p.Id}"); p.Kill(); }
+            catch (Exception ex) { Dbg($"kill {p.Id} failed: {ex.Message}"); }
+            finally { p.Dispose(); }
+        }
+        // даём мьютексу освободиться, потом захватываем заново
+        for (int i = 0; i < 20; i++)
+        {
+            Thread.Sleep(200);
+            m = new Mutex(true, name, out fresh);
+            if (fresh) return m;
+            m.Dispose();
+        }
+        return null;
+    }
+
+    static bool IsTrayProcess(Process p)
+    {
+        try
+        {
+            using var searcher = new System.Management.ManagementObjectSearcher(
+                $"SELECT CommandLine FROM Win32_Process WHERE ProcessId={p.Id}");
+            foreach (var mo in searcher.Get())
+                return (mo["CommandLine"] as string)?.Contains("--tray") == true;
+        }
+        catch { }
+        return false;
     }
 
     static bool IsAdmin()

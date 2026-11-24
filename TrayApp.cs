@@ -79,6 +79,7 @@ internal static class TrayApp
                         UpdateTip(_paused ? "MemCleaner — paused" : "MemCleaner — watching");
                         break;
                     case 3: Win32.DestroyWindow(hwnd); break; // Exit
+                    case 4: OpenConsole(); break;             // Консоль
                 }
                 break;
 
@@ -107,6 +108,7 @@ internal static class TrayApp
     static void ShowMenu()
     {
         var menu = Win32.CreatePopupMenu();
+        Win32.AppendMenu(menu, Win32.MF_STRING, (UIntPtr)4, "Консоль");
         Win32.AppendMenu(menu, Win32.MF_STRING, (UIntPtr)1, "Clean now");
         Win32.AppendMenu(menu, Win32.MF_STRING, (UIntPtr)2, _paused ? "Resume" : "Pause");
         Win32.AppendMenu(menu, Win32.MF_SEPARATOR, (UIntPtr)0, null);
@@ -119,6 +121,19 @@ internal static class TrayApp
         Win32.DestroyMenu(menu);
         if (cmd != 0)
             Win32.PostMessage(_hwnd, Win32.WM_COMMAND, (IntPtr)cmd, IntPtr.Zero);
+    }
+
+    static void OpenConsole()
+    {
+        try
+        {
+            var exe = Environment.ProcessPath
+                ?? System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName!;
+            // без аргументов = интерактивное меню; трей elevated → консоль тоже будет elevated
+            System.Diagnostics.Process.Start(exe);
+            LogLine("console opened from tray");
+        }
+        catch (Exception ex) { LogLine($"open console failed: {ex.Message}"); }
     }
 
     static void UpdateTip(string text)
